@@ -1,3 +1,203 @@
+# OpenVINO GPU Plugin Custom Op Development Guide (BevPoolV2)
+
+> Purpose: summarize a reusable workflow for developing an OpenVINO Intel GPU plugin custom op, using BevPoolV2 as the concrete example.
+
+---
+
+## 0. What changed in this iteration
+
+This guide is updated to match the current code state:
+
+1. BevPoolV2 runs on **ocl_v2 path only** for GPU plugin.
+2. BevPoolV2 **legacy OCL + kernel_selector implementation is removed**.
+3. ONNX custom op domain for exporter/frontend is unified to **org.openvinotoolkit**.
+
+Key files now used by BevPoolV2:
+
+- `src/plugins/intel_gpu/src/graph/impls/ocl_v2/bevpool_v2.hpp`
+- `src/plugins/intel_gpu/src/graph/impls/ocl_v2/bevpool_v2.cpp`
+- `src/plugins/intel_gpu/src/graph/impls/ocl_v2/bevpool_v2.cl`
+- `src/plugins/intel_gpu/src/graph/registry/bevpool_v2_impls.cpp`
+- `src/plugins/intel_gpu/src/graph/registry/registry.hpp` (`REGISTER_IMPLS(bevpool_v2)`)
+
+Removed BevPoolV2 legacy files:
+
+- `src/plugins/intel_gpu/src/graph/impls/ocl/bevpool_v2.cpp`
+- `src/plugins/intel_gpu/src/kernel_selector/kernels/bevpool_v2/*`
+- `src/plugins/intel_gpu/src/kernel_selector/cl_kernels/bevpool_v2_ref.cl`
+
+---
+
+## 1. Recommended architecture (new op)
+
+For new GPU custom ops, use this path by default:
+
+1. Core op definition
+   - `src/core/include/openvino/op/<op>.hpp`
+   - `src/core/src/op/<op>.cpp`
+2. GPU primitive + translator
+   - `src/plugins/intel_gpu/include/intel_gpu/primitives/<op>.hpp`
+   - `src/plugins/intel_gpu/src/plugin/ops/<op>.cpp`
+3. ocl_v2 implementation
+   - `src/plugins/intel_gpu/src/graph/impls/ocl_v2/<op>.hpp`
+   - `src/plugins/intel_gpu/src/graph/impls/ocl_v2/<op>.cpp`
+   - `src/plugins/intel_gpu/src/graph/impls/ocl_v2/<op>.cl`
+4. Registry hookup
+   - `src/plugins/intel_gpu/src/graph/registry/<op>_impls.cpp`
+   - `src/plugins/intel_gpu/src/graph/registry/registry.hpp`
+5. Functional tests and subgraph tests
+
+Notes:
+
+- For this BevPoolV2 migration we intentionally keep **static-shape registration only** in ocl_v2.
+- Do not add new BevPoolV2 logic under legacy `impls/ocl` or `kernel_selector`.
+
+---
+
+## 2. BevPoolV2 end-to-end mapping (current)
+
+1. ONNX frontend translates `org.openvinotoolkit::BevPoolV2`.
+2. GPU plugin translator creates `cldnn::bevpool_v2` primitive.
+3. Registry selects ocl_v2 manager (`ocl::BevPoolV2`, static shape).
+4. ocl_v2 host generator builds kernel data/JIT/dispatch.
+5. ocl_v2 kernel executes and writes output.
+
+---
+
+## 3. Common failure patterns and fixes
+
+### A) `Kernel for {result:...} is not found in the kernel cache`
+
+Typical cause: ocl_v2 stage was not added because kernel template lookup failed.
+
+What to check:
+
+1. `KernelGenerator` template name must match `.cl` filename stem.
+2. Entry-point naming is not template naming. Template key must exist in `ocl_v2` kernel DB.
+
+Concrete BevPoolV2 fix used:
+
+- changed constructor from `KernelGenerator("bevpool_v2_ref")`
+- to `KernelGenerator("bevpool_v2", "ref")`
+
+### B) `Only the kernels of the single primitive should be allowed`
+
+This often happens when compile returns empty kernels for that primitive (same root cause as A).
+
+### C) Build error from RuntimeParams/JitConstants API misuse
+
+Examples fixed in BevPoolV2:
+
+1. `params.get_input_layouts()` is invalid for `RuntimeParams`; use `params.input_layouts`.
+2. `jit.add({...})` may not match overload in some contexts; add constants one by one.
+
+---
+
+## 4. ONNX domain contract
+
+Current BevPoolV2 custom op domain:
+
+- `org.openvinotoolkit`
+
+Exporter script:
+
+- `export_bevpool_v2_custom_op.py` uses `CUSTOM_DOMAIN = "org.openvinotoolkit"`
+
+Frontend translator:
+
+- registered on `OPENVINO_ONNX_DOMAIN` (`org.openvinotoolkit`)
+- `com.intel.bevpool` compatibility registration removed
+
+If model export/import fails, verify domain + op name first.
+
+---
+
+## 5. Minimal ocl_v2 registration template (recommended)
+
+`src/plugins/intel_gpu/src/graph/registry/<op>_impls.cpp`:
+
+```cpp
+#include "intel_gpu/primitives/<op>.hpp"
+#include "primitive_inst.h"
+#include "registry.hpp"
+
+#if OV_GPU_WITH_OCL
+#    include "impls/ocl_v2/<op>.hpp"
+#endif
+
+namespace ov::intel_gpu {
+using namespace cldnn;
+
+const std::vector<std::shared_ptr<cldnn::ImplementationManager>>& Registry<<op>>::get_implementations() {
+    static const std::vector<std::shared_ptr<ImplementationManager>> impls = {
+        OV_GPU_CREATE_INSTANCE_OCL(ocl::<OpImplManager>, shape_types::static_shape)
+    };
+    return impls;
+}
+}  // namespace ov::intel_gpu
+```
+
+`src/plugins/intel_gpu/src/graph/registry/registry.hpp`:
+
+```cpp
+REGISTER_IMPLS(<op>);
+```
+
+---
+
+## 6. Development checklist for a new GPU op
+
+- [ ] Core op: attributes, `validate_and_infer_types`, `clone_with_new_inputs`
+- [ ] GPU primitive + plugin translator
+- [ ] ocl_v2 `.hpp/.cpp/.cl` host+kernel implementation
+- [ ] Registry file `<op>_impls.cpp` and `REGISTER_IMPLS(<op>)`
+- [ ] Tests: single op + subgraph + compare/input map coverage
+- [ ] ONNX domain/op contract validated
+- [ ] Build + function tests + benchmark smoke pass
+
+---
+
+## 7. Build and validation commands
+
+```bash
+cd /home/lijie/intel/intel_gpu/openvino
+rm -rf build bin
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTS=ON
+cmake --build build -j"$(nproc)"
+
+./bin/intel64/Release/ov_gpu_func_tests --gtest_filter='*BevPoolV2*' --gtest_color=yes
+
+./bin/intel64/Release/benchmark_app \
+  -m ./bevpool_v2_custom.onnx \
+  -d GPU \
+  -shape "feat[1,54,96,80],depth[1,90,54,96],indices[466560],intervals[7313,3]" \
+  -niter 100 --nireq 1
+```
+
+---
+
+## 8. Migration notes (legacy -> ocl_v2)
+
+If migrating an existing op from legacy OCL to ocl_v2:
+
+1. Add ocl_v2 host+kernel files.
+2. Add explicit registry file `<op>_impls.cpp`.
+3. Switch `REGISTER_DEFAULT_IMPLS(<op>, OCL_S)` to `REGISTER_IMPLS(<op>)` when needed.
+4. Remove legacy registration entries in:
+   - `src/plugins/intel_gpu/src/graph/impls/ocl/register.hpp`
+   - `src/plugins/intel_gpu/src/graph/impls/ocl/register.cpp`
+5. Remove legacy op-specific files in `impls/ocl` and `kernel_selector` for that op.
+6. Rebuild and run focused functional tests.
+
+---
+
+## 9. BevPoolV2 lessons learned
+
+1. Keep one active path per op during migration to reduce ambiguity.
+2. Kernel template name mismatches in ocl_v2 are high-frequency failures.
+3. Registry selection strategy (static vs dynamic shape) must match implementation capability.
+4. Domain consistency (`org.openvinotoolkit`) across exporter and frontend is mandatory.
+
 # OpenVINO GPU Plugin 自定义算子开发指南（以 BevPoolV2 为例）
 
 > 目标：把本次会话里的实战经验沉淀成一份可复用的开发/排错手册。  
